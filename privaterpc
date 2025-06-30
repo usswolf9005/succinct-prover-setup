@@ -1,0 +1,228 @@
+#!/bin/bash
+
+# Exit on any error
+set -e
+
+# Function to print messages
+print_message() {
+    echo "===> $1"
+}
+
+# Function to check if command was successful
+check_status() {
+    if [ $? -eq 0 ]; then
+        print_message "Success: $1"
+    else
+        print_message "Error: $1 failed"
+        exit 1
+    fi
+}
+
+# Function to check CUDA version
+check_cuda_version() {
+    if ! command -v nvidia-smi &> /dev/null; then
+        print_message "nvidia-smi not found"
+        return 1
+    fi
+    
+    driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | cut -d. -f1)
+    print_message "Current NVIDIA Driver Version: $driver_version"
+    
+    if [ -z "$driver_version" ] || [ "$driver_version" -lt 555 ]; then
+        print_message "Driver version $driver_version is below required 555 (for CUDA 12.5)"
+        return 1
+    fi
+    
+    print_message "Driver version $driver_version meets requirements (for CUDA 12.5+)"
+    return 0
+}
+
+# Function to check if all requirements are installed
+check_requirements_installed() {
+    if ! command -v docker &> /dev/null; then
+        return 1
+    fi
+
+    if ! dpkg -l | grep -q nvidia-container-toolkit; then
+        return 1
+    fi
+
+    if ! check_cuda_version; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Check if script is run as root
+if [ "$EUID" -ne 0 ]; then 
+    print_message "Please run as root (use sudo)"
+    exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+if check_requirements_installed; then
+    print_message "All requirements already installed, skipping system updates"
+else
+    print_message "Updating and upgrading system packages..."
+    apt update && apt upgrade -y
+    check_status "System update and upgrade"
+fi
+
+if ! command -v docker &> /dev/null; then
+    print_message "Docker not found. Installing Docker..."
+    apt install -y apt-transport-https ca-certificates curl software-properties-common
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+    add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+    apt update
+    apt install -y docker-ce docker-ce-cli containerd.io
+    check_status "Docker installation"
+
+    systemctl start docker
+    systemctl enable docker
+    check_status "Docker service setup"
+
+    if ! groups $SUDO_USER | grep -q docker; then
+        print_message "Adding user to docker group..."
+        usermod -aG docker $SUDO_USER
+        check_status "Adding user to docker group"
+        print_message "Note: Docker group changes will take effect after next login or reboot"
+    fi
+
+    docker ps -a > /dev/null 2>&1
+    check_status "Docker verification"
+else
+    print_message "Docker already installed, skipping Docker installation"
+    
+    if ! groups $SUDO_USER | grep -q docker; then
+        print_message "Adding user to docker group..."
+        usermod -aG docker $SUDO_USER
+        check_status "Adding user to docker group"
+        print_message "Note: Docker group changes will take effect after next login or reboot"
+    fi
+
+    docker ps -a > /dev/null 2>&1
+    check_status "Docker verification"
+fi
+
+if ! dpkg -l | grep -q nvidia-container-toolkit; then
+    print_message "Installing NVIDIA Container Toolkit..."
+
+    print_message "Setting up NVIDIA Container Toolkit repository..."
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+        && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    check_status "Repository setup"
+
+    apt-get update
+    check_status "Package list update"
+
+    export NVIDIA_CONTAINER_TOOLKIT_VERSION=1.17.8-1
+    apt-get install -y \
+        nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+        nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+        libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+        libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
+    check_status "NVIDIA Container Toolkit installation"
+
+    print_message "Configuring Docker to use NVIDIA Container Runtime..."
+    nvidia-ctk runtime configure --runtime=docker
+    systemctl restart docker
+    check_status "Docker runtime configuration"
+
+    print_message "Pulling Succinct prover Docker image..."
+    docker pull public.ecr.aws/succinct-labs/spn-node:latest-gpu
+    check_status "Docker image pull"
+else
+    print_message "NVIDIA Container Toolkit already installed, skipping installation"
+fi
+
+if ! check_cuda_version; then
+    print_message "Installing/Updating NVIDIA drivers to get CUDA 12.5 or higher..."
+
+    apt update
+    check_status "System update"
+
+    print_message "Installing build essential and headers..."
+    apt install -y build-essential linux-headers-$(uname -r)
+    check_status "Essential packages installation"
+
+    print_message "Removing existing NVIDIA installations..."
+    apt remove -y nvidia-* --purge
+    apt autoremove -y
+    check_status "NVIDIA cleanup"
+
+    print_message "Adding NVIDIA repository..."
+    curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O
+    dpkg -i cuda-keyring_1.1-1_all.deb
+    apt update
+    check_status "NVIDIA repository setup"
+
+    print_message "Installing latest NVIDIA driver and CUDA..."
+    apt install -y cuda-drivers
+    check_status "NVIDIA driver and CUDA installation"
+
+    print_message "NVIDIA drivers installed. System needs to reboot."
+    print_message "Please run this script again after reboot to complete the setup."
+    sleep 10
+    reboot
+fi
+
+print_message "All system requirements are installed!"
+print_message "Setting up Succinct Prover..."
+
+# Fixed values
+PROVE_PER_BPGU=0.91
+PGUS_PER_SECOND=10486000
+
+export PROVE_PER_BPGU
+export PGUS_PER_SECOND
+print_message "PROVE_PER_BPGU is set to: $PROVE_PER_BPGU"
+print_message "PGUS_PER_SECOND is set to: $PGUS_PER_SECOND"
+
+print_message "Welcome to Succinct Prover Setup!"
+print_message "Please provide the following information:"
+echo
+print_message "First, you need to create a prover at https://staking.sepolia.succinct.xyz/prover"
+print_message "After creating your prover, you will receive a Prover Address."
+read -p "Enter Prover Address: " PROVER_ADDRESS
+
+print_message "Enter the private key for your prover wallet."
+print_message "IMPORTANT: Use a fresh wallet. The private key will be used directly in the CLI."
+read -p "Enter Private Key: " PRIVATE_KEY
+
+if [[ ! $PROVER_ADDRESS =~ ^0x[a-fA-F0-9]{40}$ ]]; then
+    print_message "Error: Invalid Prover Address format. It should start with '0x' followed by 40 hexadecimal characters."
+    exit 1
+fi
+
+if [[ -z "$PRIVATE_KEY" ]]; then
+    print_message "Error: Private Key cannot be empty"
+    exit 1
+fi
+
+export PROVER_ADDRESS
+export PRIVATE_KEY
+
+print_message "Configuration complete! Starting Succinct prover..."
+echo
+print_message "Running with the following settings:"
+echo "PROVE_PER_BPGU: $PROVE_PER_BPGU"
+echo "PGUS_PER_SECOND: $PGUS_PER_SECOND"
+echo "PROVER_ADDRESS: $PROVER_ADDRESS"
+echo "PRIVATE_KEY: [HIDDEN]"
+echo
+
+docker run --gpus all \
+    --network host \
+    -e NETWORK_PRIVATE_KEY=$PRIVATE_KEY \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    public.ecr.aws/succinct-labs/spn-node:latest-gpu \
+    prove \
+    --rpc-url https://red-distinguished-breeze.ethereum-sepolia.quiknode.pro/080f5b0f89610924fa6a1c63a0c5d6527361fae8/ \
+    --throughput $PGUS_PER_SECOND \
+    --bid $PROVE_PER_BPGU \
+    --private-key $PRIVATE_KEY \
+    --prover $PROVER_ADDRESS
